@@ -4,15 +4,15 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "gamma-space-model"
-version = "0.1.0"
-description = "Gamma-structured state-space blocks with stable discretization and full-sequence execution"
+version = "0.2.0"
+description = "DPLR state-space blocks exposed through the Gamma Space Model API"
 readme = "README.md"
 requires-python = ">=3.8"
 license = {text = "MIT"}
 authors = [
     {name = "StarMists"}
 ]
-keywords = ["ssm", "state-space-models", "hippo", "sequence-modeling", "gamma-space-model"]
+keywords = ["ssm", "state-space-models", "dplr", "sequence-modeling", "gamma-space-model"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
@@ -49,9 +49,7 @@ notebook = [
     "jupyter>=1.0",
     "torchvision>=0.13",
 ]
-performance = [
-    "triton>=2.0.0;platform_system!='Windows'",
-]
+performance = []
 
 [project.urls]
 Homepage = "https://github.com/StarMists/GammaSpaceModel"
@@ -63,7 +61,7 @@ Issues = "https://github.com/StarMists/GammaSpaceModel/issues"
 include-package-data = true
 
 [tool.setuptools.packages.find]
-include = ["gamma_space_model*", "csrc*"]
+include = ["gamma_space_model*"]
 exclude = [
     "benchmarks*",
     "examples*",

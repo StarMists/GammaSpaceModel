@@ -2,33 +2,22 @@
 
 [![Smoke](https://github.com/StarMists/GammaSpaceModel/actions/workflows/smoke.yml/badge.svg)](https://github.com/StarMists/GammaSpaceModel/actions/workflows/smoke.yml)
 
-GammaSpaceModel is a lightweight PyTorch package for Gamma-structured state
-space models with structured stability and full-sequence execution.
+GammaSpaceModel is a lightweight PyTorch package for sequence modeling with a
+stable diagonal-plus-low-rank state space core. The public API stays compact:
+use `GammaSpaceLayer` for the core SSM layer or `GammaSpaceBlock` for a residual
+sequence block.
 
-The core design keeps a fixed sparse lower-bidiagonal Gamma transition matrix:
+The current implementation uses:
 
-```text
-A[n, n] = -1
-A[n, n-1] = 1
-```
-
-This structure uses only `-1`, `0`, and `1`, which makes it friendly to
-deployment settings that benefit from sparse or ternary transitions. Instead of
-replacing the transition with a dense transition parameterization, this package keeps the
-Gamma structure and adds practical structured improvements around it.
-
-## Features
-
-- Fixed ternary-friendly Gamma transition matrix
-- Learned positive timestep `dt`
-- Euler, bilinear, and ZOH discretization
-- Optional direct skip term `D`
-- Recurrent token-by-token stepping
-- Full-sequence convolutional path for longer sequences
-- Inference cache allocation for recurrent use
-- Exportable discretized inference matrices
-- Residual `GammaSpaceBlock` with input gate, output gate, activation, layer scale,
-  dropout, and optional output projection
+- learned stable diagonal dynamics
+- fixed ternary sign masks for the low-rank factors
+- learned low-rank magnitudes
+- learned positive timestep `dt`
+- optional direct skip term `D`
+- recurrent token-by-token stepping
+- full-sequence FFT execution
+- inference cache allocation for streaming use
+- exportable inference matrices
 
 ## Install
 
@@ -46,10 +35,10 @@ cd GammaSpaceModel
 pip install -e ".[dev]"
 ```
 
-Optional notebook and performance dependencies:
+Optional notebook dependencies:
 
 ```bash
-pip install -e ".[notebook,performance]"
+pip install -e ".[notebook]"
 ```
 
 ## Quick Start
@@ -77,17 +66,18 @@ from gamma_space_model import (
 )
 ```
 
-`GammaSpaceLayer` is the core state space layer. `GammaSpaceBlock` wraps it in a
-residual sequence block. `MinimalGammaSpaceBlock` keeps the structured
-discretization path while removing the richer gating/output pathway.
+`GammaSpaceLayer` is the DPLR-backed state space layer. `GammaSpaceBlock` wraps
+it in a residual sequence block with normalization, gating, activation, dropout,
+and output projection. `MinimalGammaSpaceBlock` keeps the same state transition
+while removing the richer gating/output pathway.
 
 ## Execution Modes
 
 `GammaSpaceLayer` supports three forward modes:
 
 - `kernel_mode="recurrent"`: always run recurrently through the sequence.
-- `kernel_mode="conv"`: use the full-sequence causal convolution view.
-- `kernel_mode="auto"`: switch to convolution when sequence length reaches
+- `kernel_mode="conv"`: use the full-sequence FFT path.
+- `kernel_mode="auto"`: switch to FFT execution when sequence length reaches
   `kernel_threshold`.
 
 For streaming or autoregressive use, call `step(...)` with a recurrent state:
@@ -109,10 +99,10 @@ out, state = ssm.step(token, state, cache=cache)
 
 ## Public Release Scope
 
-This repository is focused on the public Gamma Space Model algorithm, implementation,
-tests, and small usage examples. Benchmark notebooks, experiment records,
-profiling scripts, tuned training recipes, and internal comparison results are
-not part of this release.
+This repository is focused on the public Gamma Space Model implementation,
+tests, and small usage examples. Internal ablations, tuned training recipes,
+private experiment records, and private comparison notebooks are not part of
+this release.
 
 ## Public Validation
 
@@ -124,16 +114,15 @@ python examples/gamma_space_quickstart.py
 python examples/gamma_space_forecasting_demo.py
 ```
 
-The tests cover core behavior such as recurrent/full-sequence consistency,
-cached stepping, exported inference matrices, and public API boundaries. The
-examples are tiny generic usage demos, not tuned benchmark recipes.
+The tests cover recurrent/full-sequence consistency, cached stepping, exported
+inference matrices, and public API boundaries. The examples are tiny generic
+usage demos, not tuned benchmark recipes.
 
-## Public Benchmarks
+## Benchmarks
 
-See [PUBLIC_BENCHMARKS.md](PUBLIC_BENCHMARKS.md) for a fixed public benchmark
-run on complex sinusoid forecasting, permuted sequential MNIST, and copying
-memory. The benchmark page includes the full public protocol, hyperparameters,
-task configurations, result tables, and a held-out forecasting visualization.
+The previous public benchmark page was generated for an older Gamma Space Model
+core. It has been archived to avoid mixing old results with the current DPLR
+implementation. See [PUBLIC_BENCHMARKS.md](PUBLIC_BENCHMARKS.md).
 
 ## Repository Layout
 
@@ -143,8 +132,6 @@ gamma_space_model/
 |   |-- gamma_space.py
 |   |-- block.py
 |   `-- normalization.py
-|-- ops/
-|   `-- selective_scan_interface.py
 examples/
 tests/
 PUBLIC_BENCHMARKS.md
@@ -152,13 +139,8 @@ PUBLIC_BENCHMARKS.md
 
 ## References
 
-GammaSpaceModel is inspired by the state space model line of work, especially
-HiPPO-style sequence memory and selective state-space models:
-
-- Albert Gu, Tri Dao, Stefano Ermon, Atri Rudra, Christopher Re. "HiPPO:
-  Recurrent Memory with Optimal Polynomial Projections." NeurIPS 2020.
-- Albert Gu, Tri Dao. "Mamba: Linear-Time Sequence Modeling with Selective State
-  Spaces." 2023.
+GammaSpaceModel is inspired by the broader state space model line of work,
+including diagonal and low-rank sequence models.
 
 ## License
 

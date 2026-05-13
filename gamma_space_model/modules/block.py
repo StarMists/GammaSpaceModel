@@ -1,4 +1,4 @@
-"""structured Gamma block with residual mixing and optional gating."""
+"""DPLR-backed Gamma Space Model block with residual mixing and optional gating."""
 
 from __future__ import annotations
 
@@ -14,14 +14,14 @@ from .gamma_space import GammaSpaceLayer
 
 class GammaSpaceBlock(nn.Module):
     """
-    Residual Gamma block that keeps the gamma transition structure but adopts a
-    more expressive post-SSM pathway inspired by state-space blocks.
+    Residual sequence block around the DPLR-backed Gamma Space Model layer.
     """
 
     def __init__(
         self,
         d_model: int,
         hidden_dim: int,
+        rank: int = 1,
         dt_min: float = 1e-3,
         dt_max: float = 1e-1,
         dt_init: float = 1e-2,
@@ -34,6 +34,7 @@ class GammaSpaceBlock(nn.Module):
         use_D: bool = True,
         kernel_mode: str = "auto",
         kernel_threshold: int = 64,
+        max_low_rank_scale: float = 0.1,
         use_output_linear: bool = True,
         gate_bias: float = 2.0,
         input_gate: bool = True,
@@ -51,6 +52,7 @@ class GammaSpaceBlock(nn.Module):
         self.ssm = GammaSpaceLayer(
             state_dim=d_model,
             hidden_dim=hidden_dim,
+            rank=rank,
             dt_min=dt_min,
             dt_max=dt_max,
             dt_init=dt_init,
@@ -58,6 +60,7 @@ class GammaSpaceBlock(nn.Module):
             use_D=use_D,
             kernel_mode=kernel_mode,
             kernel_threshold=kernel_threshold,
+            max_low_rank_scale=max_low_rank_scale,
         )
 
         if activation == "gelu":
@@ -260,12 +263,13 @@ class GammaSpaceBlock(nn.Module):
 
 
 class MinimalGammaSpaceBlock(GammaSpaceBlock):
-    """A lighter enhanced gamma block focused on optimization stability."""
+    """A lighter Gamma Space Model block with the same DPLR state transition."""
 
     def __init__(
         self,
         d_model: int,
         hidden_dim: int,
+        rank: int = 1,
         dt_min: float = 1e-3,
         dt_max: float = 1e-1,
         dt_init: float = 1e-2,
@@ -276,10 +280,12 @@ class MinimalGammaSpaceBlock(GammaSpaceBlock):
         use_D: bool = True,
         kernel_mode: str = "auto",
         kernel_threshold: int = 64,
+        max_low_rank_scale: float = 0.1,
     ) -> None:
         super().__init__(
             d_model=d_model,
             hidden_dim=hidden_dim,
+            rank=rank,
             dt_min=dt_min,
             dt_max=dt_max,
             dt_init=dt_init,
@@ -292,6 +298,7 @@ class MinimalGammaSpaceBlock(GammaSpaceBlock):
             use_D=use_D,
             kernel_mode=kernel_mode,
             kernel_threshold=kernel_threshold,
+            max_low_rank_scale=max_low_rank_scale,
             use_output_linear=False,
             input_gate=False,
             layer_scale_init=1.0,

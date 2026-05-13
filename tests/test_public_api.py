@@ -8,5 +8,4 @@ def test_public_api_is_gamma_space_model_only():
         "MinimalGammaSpaceBlock",
         "LayerNorm",
         "RMSNorm",
-        "HAS_TILELANG_OPS",
     }

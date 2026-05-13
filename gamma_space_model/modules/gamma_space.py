@@ -1,7 +1,8 @@
-"""structured Gamma SSM with stable discretization and learned timescales."""
+"""DPLR-backed Gamma Space Model layer."""
 
 from __future__ import annotations
 
+import math
 from typing import Dict, Optional, Tuple
 
 import torch
@@ -11,43 +12,33 @@ import torch.nn.functional as F
 
 class GammaSpaceLayer(nn.Module):
     """
-    Gamma SSM variant that preserves the fixed ternary-friendly gamma transition
-    while adding practical stability features:
+    Core Gamma Space Model layer using a stable diagonal-plus-low-rank state
+    transition.
 
-    - learned positive timestep `dt`
-    - bilinear or ZOH discretization
-    - direct skip term `D`
-    - stateful recurrent stepping with reusable discretized matrices
-
-    The continuous-time transition matrix A is fixed to the lower-bidiagonal
-    gamma structure:
-
-        A[n, n] = -1
-        A[n, n-1] = 1
-
-    This keeps inference deployment compatible with hardware that benefits from
-    sparse ternary transition structure.
+    The transition has a learned negative diagonal component plus fixed ternary
+    sign masks for the low-rank factors. This keeps the public Gamma Space Model
+    API compact while moving the implementation to the current DPLR SSM core.
     """
 
     def __init__(
         self,
         state_dim: int,
         hidden_dim: int,
+        rank: int = 1,
         dt_min: float = 1e-3,
         dt_max: float = 1e-1,
         dt_init: float = 1e-2,
-        discretization: str = "bilinear",
         learn_dt: bool = True,
         use_D: bool = True,
         kernel_mode: str = "auto",
         kernel_threshold: int = 64,
+        max_low_rank_scale: float = 0.1,
+        discretization: Optional[str] = None,
     ) -> None:
         super().__init__()
-        if discretization not in {"bilinear", "zoh", "euler"}:
-            raise ValueError(
-                f"Unsupported discretization '{discretization}'. "
-                "Expected one of {'bilinear', 'zoh', 'euler'}."
-            )
+        del discretization
+        if rank < 1:
+            raise ValueError("Expected rank >= 1.")
         if kernel_mode not in {"auto", "recurrent", "conv"}:
             raise ValueError(
                 f"Unsupported kernel_mode '{kernel_mode}'. "
@@ -58,21 +49,23 @@ class GammaSpaceLayer(nn.Module):
 
         self.state_dim = state_dim
         self.hidden_dim = hidden_dim
+        self.rank = rank
         self.dt_min = dt_min
         self.dt_max = dt_max
-        self.discretization = discretization
         self.learn_dt = learn_dt
         self.use_D = use_D
         self.kernel_mode = kernel_mode
         self.kernel_threshold = kernel_threshold
+        self.max_low_rank_scale = max_low_rank_scale
 
-        A = torch.zeros(hidden_dim, hidden_dim, dtype=torch.float32)
-        indices = torch.arange(hidden_dim)
-        A[indices, indices] = -1.0
-        if hidden_dim > 1:
-            A[indices[1:], indices[:-1]] = 1.0
-        self.register_buffer("A", A)
-        self.register_buffer("I", torch.eye(hidden_dim, dtype=torch.float32))
+        real_init = torch.linspace(0.25, 1.25, hidden_dim, dtype=torch.float32)
+        self.log_lambda_real = nn.Parameter(torch.log(real_init))
+
+        self.register_buffer("ternary_u_mask", self._build_ternary_mask(hidden_dim, rank, phase=0))
+        self.register_buffer("ternary_v_mask", self._build_ternary_mask(hidden_dim, rank, phase=1))
+        self.log_u_amp = nn.Parameter(torch.full((rank, hidden_dim), -2.0, dtype=torch.float32))
+        self.log_v_amp = nn.Parameter(torch.full((rank, hidden_dim), -2.0, dtype=torch.float32))
+        self.low_rank_logit = nn.Parameter(torch.full((rank,), -2.0, dtype=torch.float32))
 
         scale = hidden_dim ** -0.5
         self.B = nn.Parameter(torch.randn(hidden_dim, state_dim) * scale)
@@ -91,25 +84,40 @@ class GammaSpaceLayer(nn.Module):
 
         self._kernel_cache: Dict[Tuple[object, ...], torch.Tensor] = {}
 
-    def clear_kernel_cache(self) -> None:
-        """Drop cached convolution kernels used by eval/no-grad full forwards."""
+    @staticmethod
+    def _build_ternary_mask(hidden_dim: int, rank: int, phase: int) -> torch.Tensor:
+        base = torch.arange(hidden_dim, dtype=torch.int64)
+        masks = []
+        for r in range(rank):
+            shifted = (base + phase + r) % 3
+            mask = torch.zeros(hidden_dim, dtype=torch.float32)
+            mask[shifted == 0] = 1.0
+            mask[shifted == 2] = -1.0
+            masks.append(mask)
+        return torch.stack(masks, dim=0)
 
+    def clear_kernel_cache(self) -> None:
         self._kernel_cache.clear()
 
     def _kernel_cache_key(
         self,
         seq_len: int,
+        fft_len: int,
         rate: float,
         dtype: torch.dtype,
         device: torch.device,
     ) -> Tuple[object, ...]:
         return (
             seq_len,
+            fft_len,
             float(rate),
             dtype,
             device.type,
             device.index,
-            self.discretization,
+            self.log_lambda_real._version,
+            self.log_u_amp._version,
+            self.log_v_amp._version,
+            self.low_rank_logit._version,
             self.B._version,
             self.C._version,
             self.D._version,
@@ -123,138 +131,106 @@ class GammaSpaceLayer(nn.Module):
             dt = dt.to(dtype=dtype)
         return dt
 
-    def _discretize(self, rate: float = 1.0, dtype: Optional[torch.dtype] = None) -> Tuple[torch.Tensor, torch.Tensor]:
+    def _discrete_params(
+        self,
+        rate: float = 1.0,
+        dtype: Optional[torch.dtype] = None,
+        device: Optional[torch.device] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         target_dtype = dtype or self.B.dtype
-        A = self.A.to(dtype=target_dtype)
-        I = self.I.to(dtype=target_dtype)
-        B = self.B.to(dtype=target_dtype)
-        dt = self._get_dt(rate=rate, dtype=target_dtype)
+        target_device = device or self.B.device
 
-        if self.discretization == "euler":
-            dA = I + dt * A
-            dB = dt * B
-        elif self.discretization == "bilinear":
-            backward = I - 0.5 * dt * A
-            forward = I + 0.5 * dt * A
-            dA = torch.linalg.solve(backward, forward)
-            dB = torch.linalg.solve(backward, dt * B)
-        else:
-            dA = torch.matrix_exp(dt * A)
-            dB = torch.linalg.solve(A, (dA - I) @ B)
+        dt = self._get_dt(rate=rate, dtype=target_dtype).to(device=target_device, dtype=target_dtype)
+        lambda_cont = -F.softplus(self.log_lambda_real).to(device=target_device, dtype=target_dtype)
+        diag = torch.exp(dt * lambda_cont)
 
-        return dA, dB
+        numerator = diag - 1.0
+        safe_denom = torch.where(lambda_cont.abs() > 1e-6, lambda_cont, torch.full_like(lambda_cont, -1.0))
+        b_scale = torch.where(lambda_cont.abs() > 1e-6, numerator / safe_denom, dt * torch.ones_like(lambda_cont))
+        B_disc = b_scale.unsqueeze(-1) * self.B.to(device=target_device, dtype=target_dtype)
 
-    def export_inference_matrices(self, rate: float = 1.0) -> Dict[str, torch.Tensor]:
-        """
-        Return the discretized matrices used during inference. This is helpful for
-        deployment flows that want to serialize the learned model into a separate
-        runtime or hardware-specific executor.
-        """
+        scale = self.max_low_rank_scale * torch.sigmoid(self.low_rank_logit).to(
+            device=target_device,
+            dtype=target_dtype,
+        )
+        u_amp = F.softplus(self.log_u_amp).to(device=target_device, dtype=target_dtype)
+        v_amp = F.softplus(self.log_v_amp).to(device=target_device, dtype=target_dtype)
+        U = (
+            self.ternary_u_mask.to(device=target_device, dtype=target_dtype)
+            * u_amp
+            * scale.unsqueeze(-1)
+        ).transpose(0, 1)
+        V = (
+            self.ternary_v_mask.to(device=target_device, dtype=target_dtype) * v_amp
+        ).transpose(0, 1)
 
-        dA, dB = self._discretize(rate=rate, dtype=self.B.dtype)
-        return {
-            "A_continuous": self.A.detach().clone(),
-            "dA": dA.detach().clone(),
-            "dB": dB.detach().clone(),
-            "C": self.C.detach().clone(),
-            "D": self.D.detach().clone(),
-            "dt": self._get_dt(rate=rate, dtype=self.B.dtype).detach().clone(),
-        }
+        return diag, U, V, B_disc
 
-    def _compute_kernel(
+    def _dense_discrete_A(
+        self,
+        rate: float = 1.0,
+        dtype: Optional[torch.dtype] = None,
+        device: Optional[torch.device] = None,
+    ) -> torch.Tensor:
+        diag, U, V, _ = self._discrete_params(rate=rate, dtype=dtype, device=device)
+        return torch.diag(diag) - torch.matmul(U, V.transpose(0, 1))
+
+    def _compute_frequency_response(
         self,
         seq_len: int,
+        fft_len: int,
         rate: float = 1.0,
         dtype: Optional[torch.dtype] = None,
         device: Optional[torch.device] = None,
         use_cache: bool = False,
     ) -> torch.Tensor:
-        """Compute the causal convolution kernel of shape (D_out, D_in, L)."""
-
         target_dtype = dtype or self.B.dtype
         target_device = device or self.B.device
-        cache_key = self._kernel_cache_key(seq_len, rate, target_dtype, target_device)
+        cache_key = self._kernel_cache_key(seq_len, fft_len, rate, target_dtype, target_device)
         if use_cache and cache_key in self._kernel_cache:
             return self._kernel_cache[cache_key]
 
-        dA, dB = self._discretize(rate=rate, dtype=dtype)
-        dA = dA.to(device=target_device, dtype=target_dtype)
-        dB = dB.to(device=target_device, dtype=target_dtype)
-        C = self.C.to(dtype=dA.dtype)
-        C = C.to(device=target_device, dtype=target_dtype)
+        diag, U, V, B_disc = self._discrete_params(rate=rate, dtype=target_dtype, device=target_device)
+        A_dense = self._dense_discrete_A(rate=rate, dtype=target_dtype, device=target_device)
+        C = self.C.to(device=target_device, dtype=target_dtype)
+        D = self.D.to(device=target_device, dtype=target_dtype)
+        identity = torch.eye(self.hidden_dim, device=target_device, dtype=target_dtype)
+        A_power = torch.linalg.matrix_power(A_dense, seq_len)
 
-        state = dB
-        kernel_terms = []
-        for _ in range(seq_len):
-            kernel_terms.append(torch.matmul(C, state))
-            state = torch.matmul(dA, state)
-        kernel = torch.stack(kernel_terms, dim=-1)
+        complex_dtype = torch.complex64 if target_dtype != torch.float64 else torch.complex128
+        freq_count = fft_len // 2 + 1
+        theta = 2.0 * math.pi * torch.arange(freq_count, device=target_device, dtype=target_dtype) / float(fft_len)
+        roots = torch.polar(torch.ones_like(theta), -theta).to(dtype=complex_dtype)
+
+        diag_complex = diag.to(dtype=complex_dtype)
+        U_complex = U.to(dtype=complex_dtype)
+        V_complex = V.to(dtype=complex_dtype)
+        B_complex = B_disc.to(dtype=complex_dtype)
+        denom = 1.0 - roots[:, None] * diag_complex[None, :]
+        inv_diag = denom.reciprocal()
+
+        inv_b = inv_diag[:, :, None] * B_complex[None, :, :]
+        omega_u = roots[:, None, None] * U_complex[None, :, :]
+        inv_u = inv_diag[:, :, None] * omega_u
+
+        vt_inv_u = torch.einsum("nr,fns->frs", V_complex, inv_u)
+        vt_inv_b = torch.einsum("nr,fnd->frd", V_complex, inv_b)
+        rank_eye = torch.eye(self.rank, device=target_device, dtype=complex_dtype).expand(freq_count, -1, -1)
+        middle = torch.linalg.inv(rank_eye + vt_inv_u)
+        correction = torch.einsum("fns,frs,frd->fnd", inv_u, middle, vt_inv_b)
+        response = inv_b - correction
+
+        finite_correction = identity.to(dtype=complex_dtype).unsqueeze(0) - (
+            roots.pow(seq_len).view(freq_count, 1, 1) * A_power.to(dtype=complex_dtype).unsqueeze(0)
+        )
+        c_term = torch.matmul(C.to(dtype=complex_dtype).unsqueeze(0), finite_correction)
+        transfer = torch.einsum("fon,fnd->fod", c_term, response)
+        diag_idx = torch.arange(self.state_dim, device=target_device)
+        transfer[:, diag_idx, diag_idx] += D.to(dtype=complex_dtype)
+
         if use_cache:
-            self._kernel_cache[cache_key] = kernel.detach()
-        return kernel
-
-    def _apply_dA_to_state(
-        self,
-        h: torch.Tensor,
-        rate: float = 1.0,
-        dtype: Optional[torch.dtype] = None,
-        cache: Optional[Dict[str, torch.Tensor]] = None,
-    ) -> torch.Tensor:
-        method = None if cache is None else cache.get("structured_method")
-        if method == "euler":
-            dt = cache["dt"]
-            shifted = torch.cat([torch.zeros_like(h[..., :1]), h[..., :-1]], dim=-1)
-            return (1.0 - dt) * h + dt * shifted
-        if method == "bilinear":
-            if "forward_matrix" in cache and "backward_matrix" in cache:
-                rhs = torch.matmul(h, cache["forward_matrix"].transpose(0, 1))
-                solved = torch.linalg.solve_triangular(
-                    cache["backward_matrix"],
-                    rhs.transpose(0, 1),
-                    upper=False,
-                )
-                return solved.transpose(0, 1)
-            a = cache["a"]
-            b = cache["b"]
-            c = cache["c"]
-            rhs0 = (c * h)[..., :1]
-            rhs_rest = (c * h)[..., 1:] + a * h[..., :-1]
-            rhs = torch.cat([rhs0, rhs_rest], dim=-1)
-            outputs = [rhs[..., :1] / b]
-            for i in range(1, rhs.size(-1)):
-                next_col = (rhs[..., i : i + 1] + a * outputs[-1]) / b
-                outputs.append(next_col)
-            return torch.cat(outputs, dim=-1)
-
-        dA, _ = self._discretize(rate=rate, dtype=dtype or h.dtype)
-        return torch.matmul(h, dA.transpose(0, 1))
-
-    def _apply_dA_to_matrix(
-        self,
-        matrix: torch.Tensor,
-        rate: float = 1.0,
-        dtype: Optional[torch.dtype] = None,
-    ) -> torch.Tensor:
-        if self.discretization == "euler":
-            dt = self._get_dt(rate=rate, dtype=dtype or matrix.dtype).to(device=matrix.device, dtype=matrix.dtype)
-            shifted = torch.cat([torch.zeros_like(matrix[:1]), matrix[:-1]], dim=0)
-            return (1.0 - dt) * matrix + dt * shifted
-        if self.discretization == "bilinear":
-            dt = self._get_dt(rate=rate, dtype=dtype or matrix.dtype).to(device=matrix.device, dtype=matrix.dtype)
-            a = 0.5 * dt
-            b = 1.0 + a
-            c = 1.0 - a
-            rhs0 = (c * matrix)[:1]
-            rhs_rest = (c * matrix)[1:] + a * matrix[:-1]
-            rhs = torch.cat([rhs0, rhs_rest], dim=0)
-            outputs = [rhs[:1] / b]
-            for i in range(1, rhs.size(0)):
-                next_row = (rhs[i : i + 1] + a * outputs[-1]) / b
-                outputs.append(next_row)
-            return torch.cat(outputs, dim=0)
-
-        dA, _ = self._discretize(rate=rate, dtype=dtype or matrix.dtype)
-        return torch.matmul(dA, matrix)
+            self._kernel_cache[cache_key] = transfer.detach()
+        return transfer
 
     def _forward_convolutional(
         self,
@@ -262,38 +238,40 @@ class GammaSpaceLayer(nn.Module):
         rate: float = 1.0,
         return_state: bool = True,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        batch, seq_len, state_dim = u.shape
+        batch, seq_len, _ = u.shape
         original_dtype = u.dtype
         fft_dtype = torch.float32 if u.dtype in {torch.float16, torch.bfloat16} else u.dtype
+        fft_len = 1 << max(1, (2 * seq_len - 1).bit_length())
         use_kernel_cache = not self.training and not torch.is_grad_enabled()
+
         with torch.autocast(device_type=u.device.type, enabled=False):
-            kernel = self._compute_kernel(
+            transfer = self._compute_frequency_response(
                 seq_len=seq_len,
+                fft_len=fft_len,
                 rate=rate,
                 dtype=fft_dtype,
                 device=u.device,
                 use_cache=use_kernel_cache,
-            ).to(dtype=fft_dtype)
-            D = self.D.to(device=u.device, dtype=fft_dtype)
-
+            )
             u_channels = u.transpose(1, 2).to(dtype=fft_dtype)
-            fft_len = 1 << max(1, (2 * seq_len - 1).bit_length())
-            kernel_f = torch.fft.rfft(kernel, n=fft_len)
             u_f = torch.fft.rfft(u_channels, n=fft_len)
-            y_f = torch.einsum("bif,oif->bof", u_f, kernel_f)
+            y_f = torch.einsum("foi,bif->bof", transfer, u_f)
             y = torch.fft.irfft(y_f, n=fft_len)[..., :seq_len]
-            y = y + u_channels * D.view(1, state_dim, 1)
             y = y.transpose(1, 2).to(dtype=original_dtype)
 
         if not return_state:
             return y, None
 
-        dA, dB = self._discretize(rate=rate, dtype=u.dtype)
-        dA_T = dA.transpose(0, 1).contiguous()
-        dB_T = dB.transpose(0, 1).contiguous()
+        cache = self.allocate_inference_cache(
+            batch_size=batch,
+            seq_len=seq_len,
+            device=u.device,
+            dtype=u.dtype,
+            rate=rate,
+        )
         h = self.init_state(batch, u.device, u.dtype)
         for t in range(seq_len):
-            h = torch.matmul(h, dA_T) + torch.matmul(u[:, t, :], dB_T)
+            _, h = self.step(u[:, t, :], h, cache=cache)
         return y, h
 
     def init_state(
@@ -317,43 +295,34 @@ class GammaSpaceLayer(nn.Module):
         del batch_size, seq_len
         if dtype is None:
             dtype = self.B.dtype
-        dA, dB = self._discretize(rate=rate, dtype=dtype)
-        cache = {
-            "dA": dA.to(device=device),
-            "dB": dB.to(device=device),
-            "C": self.C.to(device=device, dtype=dtype),
-            "D": self.D.to(device=device, dtype=dtype),
+        A_disc = self._dense_discrete_A(rate=rate, dtype=dtype, device=device)
+        _, _, _, B_disc = self._discrete_params(rate=rate, dtype=dtype, device=device)
+        C = self.C.to(device=device, dtype=dtype)
+        D = self.D.to(device=device, dtype=dtype)
+        return {
+            "A_T": A_disc.transpose(0, 1).contiguous(),
+            "B_T": B_disc.transpose(0, 1).contiguous(),
+            "C_T": C.transpose(0, 1).contiguous(),
+            "D": D,
         }
-        cache["dB_T"] = cache["dB"].transpose(0, 1).contiguous()
-        cache["C_T"] = cache["C"].transpose(0, 1).contiguous()
-        if self.discretization == "euler":
-            dt = self._get_dt(rate=rate, dtype=dtype).to(device=device, dtype=dtype)
-            cache["structured_method"] = "euler"
-            cache["dt"] = dt
-        elif self.discretization == "bilinear":
-            dt = self._get_dt(rate=rate, dtype=dtype).to(device=device, dtype=dtype)
-            A = self.A.to(device=device, dtype=dtype)
-            I = self.I.to(device=device, dtype=dtype)
-            cache["forward_matrix"] = I + 0.5 * dt * A
-            cache["backward_matrix"] = I - 0.5 * dt * A
-            cache["structured_method"] = "bilinear"
-            cache["a"] = 0.5 * dt
-            cache["b"] = 1.0 + 0.5 * dt
-            cache["c"] = 1.0 - 0.5 * dt
-        return cache
 
-    def _step_with_matrices(
-        self,
-        u: torch.Tensor,
-        h: torch.Tensor,
-        dA_T: torch.Tensor,
-        dB_T: torch.Tensor,
-        C_T: torch.Tensor,
-        D: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        h_new = torch.matmul(h, dA_T) + torch.matmul(u, dB_T)
-        y = torch.matmul(h_new, C_T) + u * D
-        return y, h_new
+    def export_inference_matrices(self, rate: float = 1.0) -> Dict[str, torch.Tensor]:
+        diag, U, V, B_disc = self._discrete_params(rate=rate, dtype=self.B.dtype, device=self.B.device)
+        A_disc = self._dense_discrete_A(rate=rate, dtype=self.B.dtype, device=self.B.device)
+        lambda_cont = -F.softplus(self.log_lambda_real).to(device=self.B.device, dtype=self.B.dtype)
+        return {
+            "A_continuous_diag": lambda_cont.detach().clone(),
+            "A_discrete": A_disc.detach().clone(),
+            "low_rank_U": U.detach().clone(),
+            "low_rank_V": V.detach().clone(),
+            "B": B_disc.detach().clone(),
+            "C": self.C.detach().clone(),
+            "D": self.D.detach().clone(),
+            "dt": self._get_dt(rate=rate, dtype=self.B.dtype).detach().clone(),
+            "ternary_u_mask": self.ternary_u_mask.detach().clone(),
+            "ternary_v_mask": self.ternary_v_mask.detach().clone(),
+            "diag": diag.detach().clone(),
+        }
 
     def step(
         self,
@@ -363,23 +332,15 @@ class GammaSpaceLayer(nn.Module):
         cache: Optional[Dict[str, torch.Tensor]] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         if cache is None:
-            dB = self._discretize(rate=rate, dtype=u.dtype)[1]
-            C = self.C.to(device=u.device, dtype=u.dtype)
-            D = self.D.to(device=u.device, dtype=u.dtype)
-            h_next = self._apply_dA_to_state(h, rate=rate, dtype=u.dtype)
-            dB_T = dB.transpose(0, 1).contiguous()
-            C_T = C.transpose(0, 1).contiguous()
-        else:
-            D = cache["D"]
-            h_next = self._apply_dA_to_state(h, cache=cache)
-            dB_T = cache.get("dB_T")
-            C_T = cache.get("C_T")
-            if dB_T is None:
-                dB_T = cache["dB"].transpose(0, 1).contiguous()
-            if C_T is None:
-                C_T = cache["C"].transpose(0, 1).contiguous()
-        h_new = h_next + torch.matmul(u, dB_T)
-        y = torch.matmul(h_new, C_T) + u * D
+            cache = self.allocate_inference_cache(
+                batch_size=u.size(0),
+                seq_len=1,
+                device=u.device,
+                dtype=u.dtype,
+                rate=rate,
+            )
+        h_new = torch.matmul(h, cache["A_T"]) + torch.matmul(u, cache["B_T"])
+        y = torch.matmul(h_new, cache["C_T"]) + u * cache["D"]
         return y, h_new
 
     def forward(
@@ -403,16 +364,17 @@ class GammaSpaceLayer(nn.Module):
         else:
             h = state.to(device=u.device, dtype=u.dtype)
 
-        dA, dB = self._discretize(rate=rate, dtype=u.dtype)
-        C = self.C.to(device=u.device, dtype=u.dtype)
-        D = self.D.to(device=u.device, dtype=u.dtype)
-        dA_T = dA.transpose(0, 1).contiguous()
-        dB_T = dB.transpose(0, 1).contiguous()
-        C_T = C.transpose(0, 1).contiguous()
+        cache = self.allocate_inference_cache(
+            batch_size=batch,
+            seq_len=seq_len,
+            device=u.device,
+            dtype=u.dtype,
+            rate=rate,
+        )
 
         outputs = []
         for t in range(seq_len):
-            y_t, h = self._step_with_matrices(u[:, t, :], h, dA_T, dB_T, C_T, D)
+            y_t, h = self.step(u[:, t, :], h, cache=cache)
             if mask is not None:
                 mask_t = mask[:, t].unsqueeze(-1).to(dtype=u.dtype)
                 y_t = y_t * mask_t

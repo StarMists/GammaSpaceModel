@@ -1,4 +1,4 @@
-"""Tests for the structured Gamma SSM modules."""
+"""Tests for the DPLR-backed Gamma Space Model modules."""
 
 import torch
 
@@ -123,58 +123,53 @@ def test_gamma_space_conv_autocast_keeps_fft_dtypes_compatible():
 
 def test_gamma_space_structured_step_matches_dense():
     torch.manual_seed(7)
-    dense = GammaSpaceLayer(
+    uncached = GammaSpaceLayer(
         state_dim=3,
         hidden_dim=6,
-        discretization="bilinear",
         kernel_mode="recurrent",
     )
-    structured = GammaSpaceLayer(
+    cached = GammaSpaceLayer(
         state_dim=3,
         hidden_dim=6,
-        discretization="bilinear",
         kernel_mode="recurrent",
     )
-    structured.load_state_dict(dense.state_dict())
+    cached.load_state_dict(uncached.state_dict())
 
     x = torch.randn(2, 11, 3)
-    state_dense = dense.init_state(batch_size=2, device=x.device, dtype=x.dtype)
-    state_structured = structured.init_state(batch_size=2, device=x.device, dtype=x.dtype)
-    dense_cache = {
-        "dA": dense._discretize(dtype=x.dtype)[0],
-        "dB": dense._discretize(dtype=x.dtype)[1],
-        "C": dense.C.to(dtype=x.dtype),
-        "D": dense.D.to(dtype=x.dtype),
-        "structured_method": None,
-    }
-    structured_cache = structured.allocate_inference_cache(
+    state_uncached = uncached.init_state(batch_size=2, device=x.device, dtype=x.dtype)
+    state_cached = cached.init_state(batch_size=2, device=x.device, dtype=x.dtype)
+    step_cache = cached.allocate_inference_cache(
         batch_size=2,
         seq_len=x.size(1),
         device=x.device,
         dtype=x.dtype,
     )
 
-    dense_outputs = []
-    structured_outputs = []
+    uncached_outputs = []
+    cached_outputs = []
     for t in range(x.size(1)):
-        y_dense, state_dense = dense.step(x[:, t, :], state_dense, cache=dense_cache)
-        y_structured, state_structured = structured.step(x[:, t, :], state_structured, cache=structured_cache)
-        dense_outputs.append(y_dense)
-        structured_outputs.append(y_structured)
+        y_uncached, state_uncached = uncached.step(x[:, t, :], state_uncached)
+        y_cached, state_cached = cached.step(x[:, t, :], state_cached, cache=step_cache)
+        uncached_outputs.append(y_uncached)
+        cached_outputs.append(y_cached)
 
-    assert torch.allclose(torch.stack(dense_outputs, dim=1), torch.stack(structured_outputs, dim=1), atol=1e-5)
-    assert torch.allclose(state_dense, state_structured, atol=1e-5)
+    assert torch.allclose(torch.stack(uncached_outputs, dim=1), torch.stack(cached_outputs, dim=1), atol=1e-5)
+    assert torch.allclose(state_uncached, state_cached, atol=1e-5)
 
 
 def test_gamma_space_export_shapes():
     model = GammaSpaceLayer(state_dim=3, hidden_dim=6)
     mats = model.export_inference_matrices()
 
-    assert mats["A_continuous"].shape == (6, 6)
-    assert mats["dA"].shape == (6, 6)
-    assert mats["dB"].shape == (6, 3)
+    assert mats["A_continuous_diag"].shape == (6,)
+    assert mats["A_discrete"].shape == (6, 6)
+    assert mats["low_rank_U"].shape == (6, 1)
+    assert mats["low_rank_V"].shape == (6, 1)
+    assert mats["B"].shape == (6, 3)
     assert mats["C"].shape == (3, 6)
     assert mats["D"].shape == (3,)
+    assert mats["ternary_u_mask"].shape == (1, 6)
+    assert mats["ternary_v_mask"].shape == (1, 6)
 
 
 def test_gamma_space_block_forward_shapes():
